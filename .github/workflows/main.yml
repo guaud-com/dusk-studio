@@ -1,0 +1,285 @@
+name: macOS build
+
+# Public test CI for macOS: compiles Release + runs the Catch2 suite. No
+# signing, no secrets, NO artifact upload — same no-free-binaries policy
+# as the Linux job. Its job is to catch macOS build/test breakage on
+# every push so a release tag isn't the first time the code compiles on
+# Mac. Unsigned release builds are produced by release.yml.
+
+on:
+  push:
+    branches: [main, 'release/**']
+  pull_request:
+    branches: [main, 'release/**']
+  workflow_dispatch:
+
+# PR runs group by repository PR number, so a newer push supersedes only that
+# PR (fork branches sharing a name can't collide on it). Push and dispatch
+# runs get a run-id group of one: any shared key lets Actions drop a pending
+# run regardless of cancel-in-progress, costing a landed commit its verdict.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# gh cache delete in the prune steps needs actions: write; everything else
+# only reads the checkout.
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  build:
+    name: Build + tests (clang Release, macOS arm64)
+    runs-on: macos-15
+    env:
+      # CMakeLists.txt auto-detects ccache (find_program -> sets
+      # CMAKE_CXX_COMPILER_LAUNCHER), so just installing it + caching its
+      # dir across runs is enough — no CMake change. Stable dir for the
+      # actions/cache key below.
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      SODIUM_VERSION: 1.0.22
+      SODIUM_SHA256: adbdd8f16149e81ac6078a03aca6fc03b592b89ef7b5ed83841c086191be3349
+      LIBARCHIVE_VERSION: 3.8.7
+      LIBARCHIVE_SHA256: d3a8ba457ae25c27c84fd2830a2efdcc5b1d40bf585d4eb0d35f47e99e5d4774
+      PKG_CONFIG_PATH: ""
+
+    steps:
+      - name: Checkout Dusk Studio (with dusk-fizz submodule)
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          # Test CI never pushes — don't leave the token in git config.
+          persist-credentials: false
+
+      - name: Install build dependencies
+        # Ninja: parallel, low-overhead generator (much faster than the
+        # default Makefiles on this many TUs). ccache: object cache that
+        # survives across runs via the actions/cache step below, so an
+        # unchanged TU isn't recompiled on the next push.
+        run: brew install ninja ccache meson pkgconf
+
+      - name: Build shared runtime dependencies (pinned, macOS 11)
+        run: |
+          bash scripts/build-macos-runtime-deps.sh "${RUNNER_TEMP}/dusk-runtime"
+          echo "PKG_CONFIG_LIBDIR=${RUNNER_TEMP}/dusk-runtime/lib/pkgconfig:${RUNNER_TEMP}/dusk-runtime/share/pkgconfig" >> "$GITHUB_ENV"
+
+      - name: Compiler identity
+        id: compiler
+        run: echo "hash=$(clang++ --version | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore static libsodium
+        # Test CI only; release.yml builds it from source every time because it
+        # ships in the DMG.
+        id: sodium-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/libsodium
+          # The workflow hash covers the build recipe (configure flags,
+          # deployment target), so a recipe edit rebuilds instead of linking
+          # the stale cached library.
+          key: libsodium-macos-15-${{ env.SODIUM_VERSION }}-${{ steps.compiler.outputs.hash }}-${{ hashFiles('.github/workflows/macos-build.yml') }}
+
+      - name: Build static libsodium (pinned)
+        # Homebrew's bottle is built for the runner OS, newer than the app's
+        # macOS 11 deployment target. Build the audited source at that target
+        # instead, and keep the app free of a Homebrew dylib dependency.
+        if: steps.sodium-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/libsodium-${SODIUM_VERSION}.tar.gz"
+          source_dir="${RUNNER_TEMP}/libsodium-source"
+          prefix="${RUNNER_TEMP}/libsodium"
+          curl --fail --location --retry 3 --retry-all-errors \
+            --output "${archive}" \
+            "https://github.com/jedisct1/libsodium/releases/download/${SODIUM_VERSION}-RELEASE/libsodium-${SODIUM_VERSION}.tar.gz"
+          echo "${SODIUM_SHA256}  ${archive}" | shasum -a 256 --check
+          mkdir -p "${source_dir}"
+          tar -xzf "${archive}" -C "${source_dir}" --strip-components=1
+          cd "${source_dir}"
+          export MACOSX_DEPLOYMENT_TARGET=11.0
+          ./configure \
+            --prefix="${prefix}" --disable-shared --enable-static
+          # Keep this small autotools build aligned with the three-core runner.
+          make -j3 check
+          make install
+
+      - name: Build static libarchive (pinned, macOS 11)
+        run: |
+          set -euo pipefail
+          archive="${RUNNER_TEMP}/libarchive-${LIBARCHIVE_VERSION}.tar.xz"
+          source_dir="${RUNNER_TEMP}/libarchive-source"
+          build_dir="${RUNNER_TEMP}/libarchive-build"
+          prefix="${RUNNER_TEMP}/libarchive"
+          sdk="$(xcrun --sdk macosx --show-sdk-path)"
+          curl --fail --location --proto '=https' --proto-redir '=https' \
+            --retry 3 --retry-all-errors --output "${archive}" \
+            "https://github.com/libarchive/libarchive/releases/download/v${LIBARCHIVE_VERSION}/libarchive-${LIBARCHIVE_VERSION}.tar.xz"
+          echo "${LIBARCHIVE_SHA256}  ${archive}" | shasum -a 256 --check
+          mkdir -p "${source_dir}"
+          tar -xJf "${archive}" -C "${source_dir}" --strip-components=1
+          cmake -S "${source_dir}" -B "${build_dir}" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="${prefix}" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0 -DCMAKE_OSX_SYSROOT="${sdk}" \
+            -DZLIB_INCLUDE_DIR="${sdk}/usr/include" -DZLIB_LIBRARY="${sdk}/usr/lib/libz.tbd" \
+            -DICONV_INCLUDE_DIR="${sdk}/usr/include" -DLIBICONV_PATH="${sdk}/usr/lib/libiconv.tbd" \
+            -DBUILD_SHARED_LIBS=OFF -DENABLE_ZLIB=ON -DENABLE_ICONV=ON \
+            -DENABLE_OPENSSL=OFF -DENABLE_NETTLE=OFF -DENABLE_MBEDTLS=OFF \
+            -DENABLE_LIBB2=OFF -DENABLE_LZ4=OFF -DENABLE_LZO=OFF -DENABLE_LZMA=OFF \
+            -DENABLE_ZSTD=OFF -DENABLE_BZip2=OFF -DENABLE_LIBXML2=OFF -DENABLE_EXPAT=OFF \
+            -DENABLE_PCREPOSIX=OFF -DENABLE_PCRE2POSIX=OFF -DENABLE_LIBGCC=OFF \
+            -DENABLE_CNG=OFF -DENABLE_WIN32_XMLLITE=OFF -DENABLE_XATTR=OFF -DENABLE_ACL=OFF \
+            -DENABLE_TAR=OFF -DENABLE_CPIO=OFF -DENABLE_CAT=OFF -DENABLE_UNZIP=OFF -DENABLE_TEST=OFF
+          cmake --build "${build_dir}" -j5
+          cmake --install "${build_dir}"
+          minimum_versions="$(otool -l "${prefix}/lib/libarchive.a" | awk '$1 == "minos" {print $2}' | sort -u)"
+          [[ "${minimum_versions}" == 11.0 ]] || {
+            echo "::error::libarchive objects do not all target macOS 11.0" >&2; exit 1; }
+
+      - name: Restore ccache objects
+        # Restore on every run, save only from main (below): a snapshot per PR
+        # push filled the repository's 10 GB cache quota within hours and
+        # evicted the snapshots the next run needed.
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-macos-15-${{ github.sha }}
+          restore-keys: |
+            ccache-macos-15-
+
+      - name: Clone JUCE 8.0.4 (upstream)
+        run: |
+          git clone --depth 1 --branch 8.0.4 \
+            https://github.com/juce-framework/JUCE.git \
+            "${RUNNER_TEMP}/JUCE"
+
+      - name: Clone Dusk plugins
+        uses: ./.github/actions/clone-donor
+
+      - name: Clone DAF
+        uses: ./.github/actions/clone-daf-stack
+
+      - name: Configure (Release)
+        run: |
+          set -euo pipefail
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/libarchive;${RUNNER_TEMP}/dusk-runtime" \
+            -DSndFile_DIR="${RUNNER_TEMP}/dusk-runtime/lib/cmake/SndFile" \
+            -DLAME_LIBRARY="${RUNNER_TEMP}/dusk-runtime/lib/libmp3lame.dylib" \
+            -DLAME_INCLUDE_DIR="${RUNNER_TEMP}/dusk-runtime/include" \
+            -DDUSKSTUDIO_SODIUM_ROOT="${RUNNER_TEMP}/libsodium" \
+            -DJUCE_PATH="${RUNNER_TEMP}/JUCE" \
+            -DDUSK_PLUGINS_PATH="${RUNNER_TEMP}/plugins" \
+            -DDAF_PATH="${RUNNER_TEMP}/DAF" \
+            -DDUSKSTUDIO_NATIVE_CLAP=ON \
+            -DDUSKSTUDIO_NATIVE_LV2=ON \
+            -DDUSKSTUDIO_REQUIRE_LAME=ON \
+            -DDUSKSTUDIO_NATIVE_VST3=ON
+          for option in DUSKSTUDIO_NATIVE_CLAP DUSKSTUDIO_NATIVE_LV2 DUSKSTUDIO_NATIVE_VST3; do
+            grep -q "^${option}:BOOL=ON$" build/CMakeCache.txt || {
+              echo "::error::${option} was not enabled in the app configure" >&2; exit 1; }
+          done
+          grep -Eq '^DUSKSTUDIO_SODIUM_STATIC_LIBRARY:FILEPATH=.*/libsodium\.a$' build/CMakeCache.txt || {
+            echo "::error::macOS app configure did not select static libsodium" >&2; exit 1; }
+          grep -Eq '^LibArchive_LIBRARY:FILEPATH=.*/libarchive/lib/libarchive\.a$' build/CMakeCache.txt || {
+            echo "::error::macOS app configure did not select pinned static libarchive" >&2; exit 1; }
+
+      - name: Build (Release)
+        # Preserve Ninja's five-worker default on this three-core runner,
+        # but keep the limit explicit so generator changes cannot unbound it.
+        run: cmake --build build -j5
+
+      - name: Verify macOS 11 sandbox helper
+        run: |
+          set -euo pipefail
+          app="build/DuskStudio_artefacts/Release/DuskStudio.app/Contents/MacOS"
+          for binary in "$app/DuskStudio" "$app/dusk-studio-plugin-host"; do
+            [[ -x "$binary" ]] || {
+              echo "::error::missing executable: $binary" >&2; exit 1; }
+            otool -l "$binary" | grep -E 'minos +11\.0' >/dev/null || {
+              echo "::error::$binary does not target macOS 11.0" >&2; exit 1; }
+          done
+
+      - name: Smoke launch (--version)
+        run: build/DuskStudio_artefacts/Release/DuskStudio.app/Contents/MacOS/DuskStudio --version
+
+      - name: Headless self-test (DUSKSTUDIO_RUN_SELFTEST=1)
+        # Same coverage as the Linux job: full AudioEngine construction, plugin
+        # scan attempt, synthetic DSP. The runner has no GNU timeout, so the
+        # bound is perl's alarm, which survives the exec. 90 s because there is
+        # no audio device and the readiness wait burns its budget first.
+        run: |
+          perl -e 'alarm shift @ARGV; exec @ARGV' 90 \
+            env DUSKSTUDIO_RUN_SELFTEST=1 \
+            build/DuskStudio_artefacts/Release/DuskStudio.app/Contents/MacOS/DuskStudio
+
+      - name: Configure + build + run tests
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-tests -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${RUNNER_TEMP}/libarchive;${RUNNER_TEMP}/dusk-runtime" \
+            -DSndFile_DIR="${RUNNER_TEMP}/dusk-runtime/lib/cmake/SndFile" \
+            -DLAME_LIBRARY="${RUNNER_TEMP}/dusk-runtime/lib/libmp3lame.dylib" \
+            -DLAME_INCLUDE_DIR="${RUNNER_TEMP}/dusk-runtime/include" \
+            -DDUSKSTUDIO_SODIUM_ROOT="${RUNNER_TEMP}/libsodium" \
+            -DDUSKSTUDIO_BUILD_TESTS=ON \
+            -DJUCE_PATH="${RUNNER_TEMP}/JUCE" \
+            -DDUSK_PLUGINS_PATH="${RUNNER_TEMP}/plugins" \
+            -DDAF_PATH="${RUNNER_TEMP}/DAF" \
+            -DDUSKSTUDIO_NATIVE_CLAP=ON \
+            -DDUSKSTUDIO_NATIVE_LV2=ON \
+            -DDUSKSTUDIO_REQUIRE_LAME=ON \
+            -DDUSKSTUDIO_NATIVE_VST3=ON
+          for option in DUSKSTUDIO_NATIVE_CLAP DUSKSTUDIO_NATIVE_LV2 DUSKSTUDIO_NATIVE_VST3; do
+            grep -q "^${option}:BOOL=ON$" build-tests/CMakeCache.txt || {
+              echo "::error::${option} was not enabled in the test configure" >&2; exit 1; }
+          done
+          grep -Eq '^DUSKSTUDIO_SODIUM_STATIC_LIBRARY:FILEPATH=.*/libsodium\.a$' build-tests/CMakeCache.txt || {
+            echo "::error::macOS test configure did not select static libsodium" >&2; exit 1; }
+          grep -Eq '^LibArchive_LIBRARY:FILEPATH=.*/libarchive/lib/libarchive\.a$' build-tests/CMakeCache.txt || {
+            echo "::error::macOS test configure did not select pinned static libarchive" >&2; exit 1; }
+          cmake --build build-tests --target dusk-studio-tests -j5
+          ctest --test-dir build-tests --output-on-failure --parallel 3
+
+      - name: Slowest compiles
+        # A single translation unit can dominate this runner's build time
+        # (memory pressure on 7 GB); list the worst edges so it shows.
+        if: always()
+        run: |
+          for dir in build build-tests; do
+            [[ -f "$dir/.ninja_log" ]] || continue
+            echo "== $dir"
+            awk -F'\t' '!/^#/ { printf "%7.1f s  %s\n", ($2 - $1) / 1000, $4 }' "$dir/.ninja_log" \
+              | sort -rn | head -10
+          done
+
+      - name: ccache stats
+        if: always()
+        run: ccache -s
+
+      - name: Save ccache objects (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-macos-15-${{ github.sha }}
+
+      - name: Save static libsodium (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.sodium-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ runner.temp }}/libsodium
+          key: ${{ steps.sodium-cache.outputs.cache-primary-key }}
+
+      - name: Prune older ccache snapshots (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh cache list --repo "$GITHUB_REPOSITORY" --key ccache-macos-15- \
+              --sort created_at --order desc --limit 100 --json id \
+            | jq -r '.[1:][].id' \
+            | while IFS= read -r id; do
+                gh cache delete "$id" --repo "$GITHUB_REPOSITORY"
+              done
